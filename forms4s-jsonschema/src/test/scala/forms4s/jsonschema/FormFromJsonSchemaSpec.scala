@@ -3,6 +3,7 @@ package forms4s.jsonschema
 import forms4s.FormElement
 import forms4s.FormElement.Text.Format
 import org.scalatest.freespec.AnyFreeSpec
+import sttp.apispec.{Discriminator, ExampleSingleValue, Schema as ASchema, SchemaType}
 import sttp.tapir.Schema as TSchema
 import sttp.tapir.Schema.annotations.validate
 import sttp.tapir.Validator.Pattern
@@ -11,6 +12,7 @@ import sttp.tapir.generic.Configuration
 
 import java.time.*
 import java.util.UUID
+import scala.collection.immutable.ListMap
 
 class FormFromJsonSchemaSpec extends AnyFreeSpec {
 
@@ -232,6 +234,50 @@ class FormFromJsonSchemaSpec extends AnyFreeSpec {
             FormElement.Group(simpleCore("B", "B"), List(FormElement.Number(simpleCore("b", "B"), true))),
           ),
           Some("tpe"),
+        )
+        assert(form == expected)
+      }
+      "with discriminator values different from variant titles" in {
+        given Configuration = Configuration.default.withDiscriminator("tpe").withScreamingSnakeCaseDiscriminatorValues
+        sealed trait Foo derives TSchema
+        case class FirstOption(a: Int)  extends Foo
+        case class SecondOption(b: Int) extends Foo
+
+        val form     = getForm[Foo]()
+        val expected = FormElement.Alternative(
+          simpleCore("Foo", "Foo"),
+          List(
+            FormElement.Group(simpleCore("FIRST_OPTION", "FirstOption"), List(FormElement.Number(simpleCore("a", "A"), true))),
+            FormElement.Group(simpleCore("SECOND_OPTION", "SecondOption"), List(FormElement.Number(simpleCore("b", "B"), true))),
+          ),
+          Some("tpe"),
+        )
+        assert(form == expected)
+      }
+      "with discriminator constant and no mapping" in {
+        def variant(kind: String, field: String) = ASchema(
+          title = Some(s"Variant ${kind.capitalize}"),
+          `type` = Some(List(SchemaType.Object)),
+          required = List("kind", field),
+          properties = ListMap(
+            "kind" -> ASchema(`type` = Some(List(SchemaType.String)), `const` = Some(ExampleSingleValue(kind))),
+            field  -> ASchema(`type` = Some(List(SchemaType.Integer))),
+          ),
+        )
+        val schema                               = ASchema(
+          title = Some("Foo"),
+          oneOf = List(variant("first", "a"), variant("second", "b")),
+          discriminator = Some(Discriminator("kind", None)),
+        )
+
+        val form     = FormFromJsonSchema.convert(schema)
+        val expected = FormElement.Alternative(
+          simpleCore("Foo", "Foo"),
+          List(
+            FormElement.Group(simpleCore("first", "Variant First"), List(FormElement.Number(simpleCore("a", "A"), true))),
+            FormElement.Group(simpleCore("second", "Variant Second"), List(FormElement.Number(simpleCore("b", "B"), true))),
+          ),
+          Some("kind"),
         )
         assert(form == expected)
       }

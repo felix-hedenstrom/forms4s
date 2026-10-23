@@ -5,7 +5,7 @@ import cats.syntax.all.*
 import forms4s.FormElement
 import forms4s.FormElement.Text.Format
 import forms4s.validation.{FormatValidator, RegexValidator, Validator}
-import sttp.apispec.{AnySchema, ExampleMultipleValue, ExampleSingleValue, Schema as ASchema, SchemaLike, SchemaType}
+import sttp.apispec.{AnySchema, Discriminator, ExampleMultipleValue, ExampleSingleValue, Schema as ASchema, SchemaLike, SchemaType}
 
 import java.util.UUID
 import scala.annotation.tailrec
@@ -99,7 +99,10 @@ object FormFromJsonSchema {
       } else {
         val discriminator = schema.discriminator.map(_.propertyName)
         variants
-          .traverse { subSchema => createElement(None, subSchema, required = true, defs, discriminator) } // TODO required seems fishy
+          .traverse { subSchema =>
+            val variantId = schema.discriminator.flatMap(discriminatorValue(_, subSchema, defs))
+            createElement(variantId, subSchema, required = true, defs, discriminator)
+          } // TODO required seems fishy
           .map { subElems => FormElement.Alternative(core(Seq()), subElems, discriminator) }
       }
     } else {
@@ -165,6 +168,41 @@ object FormFromJsonSchema {
       }
     }
   }
+
+  private def discriminatorValue(discriminator: Discriminator, variant: SchemaLike, defs: Map[String, SchemaLike]): Option[String] = {
+    val fromMapping = refOf(variant).flatMap(ref => discriminator.mapping.flatMap(_.collectFirst { case (value, `ref`) => value }))
+    fromMapping.orElse(resolve(variant, defs).flatMap(constantOf(_, discriminator.propertyName)))
+  }
+
+  private def constantOf(schema: ASchema, property: String): Option[String] =
+    schema.properties
+      .get(property)
+      .flatMap {
+        case propertySchema: ASchema => propertySchema.`const`.orElse(propertySchema.`enum`.collect { case List(single) => single })
+        case _: AnySchema            => None
+      }
+      .collect { case ExampleSingleValue(value: String) => value }
+
+  private def refOf(schema: SchemaLike): Option[String] =
+    schema match {
+      case schema: ASchema => schema.$ref
+      case _: AnySchema    => None
+    }
+
+  @tailrec
+  private def resolve(schema: SchemaLike, defs: Map[String, SchemaLike]): Option[ASchema] =
+    schema match {
+      case _: AnySchema    => None
+      case schema: ASchema =>
+        schema.$ref match {
+          case Some(ref) =>
+            defs.get(ref.split("/").last) match {
+              case Some(resolved) => resolve(resolved, defs)
+              case None           => None
+            }
+          case None      => Some(schema)
+        }
+    }
 
   def isNull(schema: SchemaLike): Boolean = {
     schema match {
