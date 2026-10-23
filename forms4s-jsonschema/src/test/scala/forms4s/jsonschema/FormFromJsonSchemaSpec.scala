@@ -106,6 +106,45 @@ class FormFromJsonSchemaSpec extends AnyFreeSpec {
       )
     }
 
+    "recursive schemas" - {
+      "alternative variants that recurse are left out beyond the recursion limit" in {
+        val schema = rootRef(
+          "Expr",
+          "Expr" -> ASchema(
+            title = Some("Expr"),
+            oneOf = List(ref("Add"), ref("Lit")),
+            discriminator = Some(Discriminator("tpe", Some(ListMap("Add" -> "#/$defs/Add", "Lit" -> "#/$defs/Lit")))),
+          ),
+          "Add"  -> objectSchema("Add", "tpe" -> constSchema("Add"), "left" -> ref("Expr"), "right" -> ref("Expr")),
+          "Lit"  -> objectSchema("Lit", "tpe" -> constSchema("Lit"), "value" -> integerSchema),
+        )
+
+        val alternatives = alternativesIn(FormFromJsonSchema.convert(schema))
+
+        assert(alternatives.map(_.variants.map(_.core.id)).sortBy(_.size) == List.fill(4)(List("Lit")) ++ List.fill(3)(List("Add", "Lit")))
+      }
+      "optional fields that recurse are left out beyond the recursion limit" in {
+        val schema = rootRef(
+          "Node",
+          "Node" -> objectSchema("Node", "value" -> integerSchema, "next" -> ref("Node")).copy(required = List("value")),
+        )
+
+        def depth(element: FormElement): Int = element match {
+          case group: FormElement.Group =>
+            group.elements.collectFirst { case next: FormElement.Group if next.core.id == "next" => 1 + depth(next) }.getOrElse(0)
+          case _                        => 0
+        }
+
+        assert(depth(FormFromJsonSchema.convert(schema)) == 2)
+      }
+      "required fields that recurse fail instead of overflowing the stack" in {
+        val schema = rootRef("Loop", "Loop" -> objectSchema("Loop", "value" -> integerSchema, "next" -> ref("Loop")))
+
+        val error = intercept[RuntimeException](FormFromJsonSchema.convert(schema))
+        assert(error.getMessage.contains("Schema #/$defs/Loop is nested more than 3 times"))
+      }
+    }
+
     "optional fields are not required" - {
       case class Opt(a: Option[String], b: String) derives TSchema
       val expected = FormElement.Group(
@@ -309,6 +348,25 @@ class FormFromJsonSchemaSpec extends AnyFreeSpec {
 
   def simpleCore(name: String, label: String = null): FormElement.Core[Any] =
     FormElement.Core(name, Option(label).getOrElse(name), None, Seq())
+
+  def rootRef(name: String, defs: (String, ASchema)*): ASchema =
+    ASchema($ref = Some(s"#/$$defs/$name"), $defs = Some(ListMap(defs*)))
+
+  def ref(name: String): ASchema = ASchema($ref = Some(s"#/$$defs/$name"))
+
+  def objectSchema(title: String, properties: (String, ASchema)*): ASchema =
+    ASchema(title = Some(title), `type` = Some(List(SchemaType.Object)), required = properties.map(_._1).toList, properties = ListMap(properties*))
+
+  val integerSchema: ASchema = ASchema(`type` = Some(List(SchemaType.Integer)))
+
+  def constSchema(value: String): ASchema = ASchema(`type` = Some(List(SchemaType.String)), `const` = Some(ExampleSingleValue(value)))
+
+  def alternativesIn(element: FormElement): List[FormElement.Alternative] = element match {
+    case alternative: FormElement.Alternative => alternative :: alternative.variants.toList.flatMap(alternativesIn)
+    case group: FormElement.Group             => group.elements.flatMap(alternativesIn)
+    case multivalue: FormElement.Multivalue   => alternativesIn(multivalue.item)
+    case _                                    => Nil
+  }
 
   def optionalCore(name: String, label: String): FormElement.Core[Any] =
     FormElement.Core(name, label, None, Seq(), required = false)

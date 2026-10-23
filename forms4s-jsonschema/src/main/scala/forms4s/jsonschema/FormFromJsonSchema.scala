@@ -15,40 +15,68 @@ import scala.util.matching.Regex
 object FormFromJsonSchema {
 
   def convert(root: ASchema): FormElement = {
-    val result = createElement(None, root, required = true, root.$defs.getOrElse(Map()), None)
+    val result = createElement(None, root, required = true, root.$defs.getOrElse(Map()), None, Nil)
     // TODO we need much better error reporting here, this is wrong on many levels
     //  we probably should just pass errors to the client
     result match {
       case Ior.Right(form)        => form
       case Ior.Left(errors)       =>
         throw new RuntimeException(s"""Failed to generate form from JSON schema.
-                                      |${errors.mkString(", ")}""".stripMargin)
+                                      |${errors.map(_.message).mkString(", ")}""".stripMargin)
       case Ior.Both(errors, form) =>
         // we don't have logging dependency right now, and printlns is the only thing thats available ootb on all platforms
         // This should be replaced with something better soon
         println(s"""Errors spotted when generating form from JSON schema.
-                   |${errors.mkString(", ")}""".stripMargin)
+                   |${errors.map(_.message).mkString(", ")}""".stripMargin)
         form
     }
   }
 
-  type Result = Ior[List[String], List[FormElement]]
+  private val MaxRecursionDepth = 3
+
+  private enum ConversionError {
+    case Invalid(reason: String)
+    case RecursionLimitReached(ref: String)
+
+    def message: String = this match {
+      case Invalid(reason)            => reason
+      case RecursionLimitReached(ref) => s"Schema $ref is nested more than $MaxRecursionDepth times"
+    }
+  }
+
+  private type Result = Ior[List[ConversionError], List[FormElement]]
 
   /** Recursively extract all properties as FormElements */
   private def extractElements(
       schema: ASchema,
       requiredFields: Set[String],
       defs: Map[String, SchemaLike],
+      refPath: List[String],
   ): Result = {
-    schema.properties.toList
+    val (recursive, buildable) = schema.properties.toList
       .map({ case (name, subschema) =>
         val isReq = requiredFields.contains(name)
-        createElement(name.some, subschema, isReq, defs, None)
+        isReq -> createElement(name.some, subschema, isReq, defs, None, refPath)
       })
-      .map(_.map(List(_)))
-      .combineAllOption
-      .getOrElse(Ior.left(List("No properties found")))
+      .partition((_, element) => isRecursionLimited(element))
+    val recursionErrors        = recursive.flatMap((_, element) => element.left.toList.flatten)
+    if (recursive.exists((isReq, _) => isReq)) Ior.left(recursionErrors)
+    else
+      buildable
+        .map((_, element) => element.map(List(_)))
+        .combineAllOption
+        .getOrElse(Ior.left(if (recursionErrors.isEmpty) List(ConversionError.Invalid("No properties found")) else recursionErrors))
   }
+
+  private def isRecursionLimited(element: Ior[List[ConversionError], FormElement]): Boolean =
+    element match {
+      case Ior.Left(errors) =>
+        errors.forall {
+          case ConversionError.RecursionLimitReached(_) => true
+          case ConversionError.Invalid(_)               => false
+        }
+      case _                => false
+    }
 
   private def capitalizeAndSplitWords(str: String): String =
     str.split("(?=\\p{Upper})").map(_.capitalize).mkString(" ")
@@ -60,24 +88,27 @@ object FormFromJsonSchema {
       required: Boolean,
       defs: Map[String, SchemaLike],
       parentDiscriminator: Option[String],
-  ): Ior[List[String], FormElement] = {
+      refPath: List[String],
+  ): Ior[List[ConversionError], FormElement] = {
     schema match {
       case schema: AnySchema   =>
         val name = nameOverride.getOrElse("")
         schema match {
           case AnySchema.Anything =>
             FormElement.Text(FormElement.Core(name, capitalizeAndSplitWords(name), None, Seq(), required), Format.Raw).rightIor
-          case AnySchema.Nothing  => List("Nothing schema for a property is not expected").leftIor
+          case AnySchema.Nothing  => List(ConversionError.Invalid("Nothing schema for a property is not expected")).leftIor
         }
       case unresolved: ASchema =>
         unresolved.$ref match {
-          case Some(value) =>
+          case Some(value) if refPath.count(_ == value) >= MaxRecursionDepth =>
+            List(ConversionError.RecursionLimitReached(value)).leftIor
+          case Some(value)                                                   =>
             val key = value.split("/").last
             defs.get(key) match {
-              case Some(schema) => createElement(nameOverride, schema, required, defs, parentDiscriminator)
-              case None         => List(s"Schema for $key not found in $defs").leftIor
+              case Some(schema) => createElement(nameOverride, schema, required, defs, parentDiscriminator, value :: refPath)
+              case None         => List(ConversionError.Invalid(s"Schema for $key not found in $defs")).leftIor
             }
-          case None        => handleSchema(nameOverride, unresolved, required, defs, parentDiscriminator)
+          case None                                                          => handleSchema(nameOverride, unresolved, required, defs, parentDiscriminator, refPath)
         }
     }
   }
@@ -88,7 +119,8 @@ object FormFromJsonSchema {
       required: Boolean,
       defs: Map[String, SchemaLike],
       parentDiscriminator: Option[String],
-  ): Ior[List[String], FormElement] = {
+      refPath: List[String],
+  ): Ior[List[ConversionError], FormElement] = {
     val name                                   = nameOverride.getOrElse(schema.title.getOrElse("unknown"))
     val label                                  = schema.title.getOrElse(capitalizeAndSplitWords(name))
     def core[T](validators: Seq[Validator[T]]) = FormElement.Core(name, label, schema.description, validators, required)
@@ -96,14 +128,15 @@ object FormFromJsonSchema {
     val variants = schema.oneOf ++ schema.anyOf
     if (variants.nonEmpty) {
       if (variants.size == 2 && variants.exists(isNull)) {
-        createElement(nameOverride, variants.find(x => !isNull(x)).get, required = false, defs, None)
+        createElement(nameOverride, variants.find(x => !isNull(x)).get, required = false, defs, None, refPath)
       } else {
         val discriminator = schema.discriminator.map(_.propertyName)
-        variants
-          .traverse { subSchema =>
-            val variantId = schema.discriminator.flatMap(discriminatorValue(_, subSchema, defs))
-            createElement(variantId, subSchema, required = true, defs, discriminator)
-          } // TODO required seems fishy
+        val built         = variants.map { subSchema =>
+          val variantId = schema.discriminator.flatMap(discriminatorValue(_, subSchema, defs))
+          createElement(variantId, subSchema, required = true, defs, discriminator, refPath)
+        } // TODO required seems fishy
+        val kept          = built.filterNot(isRecursionLimited)
+        (if (kept.isEmpty) built else kept).sequence
           .map { subElems => FormElement.Alternative(core(Seq()), subElems, discriminator) }
       }
     } else {
@@ -116,12 +149,12 @@ object FormFromJsonSchema {
           tpe match {
             case SchemaType.Boolean => FormElement.Checkbox(core(Seq())).rightIor
             case SchemaType.Object  =>
-              extractElements(schema, schema.required.toSet, defs)
+              extractElements(schema, schema.required.toSet, defs, refPath)
                 .map(subElems => FormElement.Group(core(Seq()), subElems.filter(x => !parentDiscriminator.contains(x.core.id))))
             case SchemaType.Array   =>
               schema.items
-                .map(schema => createElement(None, schema, required = true, defs, None))
-                .getOrElse(List(s"No items schema for array $name").leftIor)
+                .map(schema => createElement(None, schema, required = true, defs, None, refPath))
+                .getOrElse(List(ConversionError.Invalid(s"No items schema for array $name")).leftIor)
                 .map(itemElem => FormElement.Multivalue(core(Seq()), itemElem))
             case SchemaType.Number  => FormElement.Number(core(Seq()), isInteger = false).rightIor
             case SchemaType.Integer => FormElement.Number(core(Seq()), isInteger = true).rightIor
@@ -129,7 +162,7 @@ object FormFromJsonSchema {
               for {
                 enumOptions <- schema.`enum`.getOrElse(Nil).traverse {
                                  case ExampleSingleValue(value) => value.toString.rightIor
-                                 case ExampleMultipleValue(_)   => "Multivalue options not supported for enums".pure[List].leftIor
+                                 case ExampleMultipleValue(_)   => List(ConversionError.Invalid("Multivalue options not supported for enums")).leftIor
                                }
               } yield {
                 if (enumOptions.nonEmpty) {
@@ -163,9 +196,9 @@ object FormFromJsonSchema {
                 }
               }
 
-            case SchemaType.Null => List("Null schema for a property is not expected").leftIor
+            case SchemaType.Null => List(ConversionError.Invalid("Null schema for a property is not expected")).leftIor
           }
-        case None      => List("Schema type not specified").leftIor
+        case None      => List(ConversionError.Invalid("Schema type not specified")).leftIor
       }
     }
   }
