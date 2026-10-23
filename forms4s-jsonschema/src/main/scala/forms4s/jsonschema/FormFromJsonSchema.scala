@@ -66,7 +66,7 @@ object FormFromJsonSchema {
         val name = nameOverride.getOrElse("")
         schema match {
           case AnySchema.Anything =>
-            FormElement.Text(FormElement.Core(name, capitalizeAndSplitWords(name), None, Seq()), Format.Raw).rightIor
+            FormElement.Text(FormElement.Core(name, capitalizeAndSplitWords(name), None, Seq(), required), Format.Raw).rightIor
           case AnySchema.Nothing  => List("Nothing schema for a property is not expected").leftIor
         }
       case unresolved: ASchema =>
@@ -77,7 +77,7 @@ object FormFromJsonSchema {
               case Some(schema) => createElement(nameOverride, schema, required, defs, parentDiscriminator)
               case None         => List(s"Schema for $key not found in $defs").leftIor
             }
-          case None        => handleSchema(nameOverride, unresolved, defs, parentDiscriminator)
+          case None        => handleSchema(nameOverride, unresolved, required, defs, parentDiscriminator)
         }
     }
   }
@@ -85,17 +85,18 @@ object FormFromJsonSchema {
   private def handleSchema(
       nameOverride: Option[String],
       schema: ASchema,
+      required: Boolean,
       defs: Map[String, SchemaLike],
       parentDiscriminator: Option[String],
   ): Ior[List[String], FormElement] = {
     val name                                   = nameOverride.getOrElse(schema.title.getOrElse("unknown"))
     val label                                  = schema.title.getOrElse(capitalizeAndSplitWords(name))
-    def core[T](validators: Seq[Validator[T]]) = FormElement.Core(name, label, schema.description, validators)
+    def core[T](validators: Seq[Validator[T]]) = FormElement.Core(name, label, schema.description, validators, required)
 
     val variants = schema.oneOf ++ schema.anyOf
     if (variants.nonEmpty) {
       if (variants.size == 2 && variants.exists(isNull)) {
-        createElement(None, variants.find(x => !isNull(x)).get, required = false, defs, None)
+        createElement(nameOverride, variants.find(x => !isNull(x)).get, required = false, defs, None)
       } else {
         val discriminator = schema.discriminator.map(_.propertyName)
         variants
@@ -119,7 +120,7 @@ object FormFromJsonSchema {
                 .map(subElems => FormElement.Group(core(Seq()), subElems.filter(x => !parentDiscriminator.contains(x.core.id))))
             case SchemaType.Array   =>
               schema.items
-                .map(schema => createElement(None, schema, false, defs, None))
+                .map(schema => createElement(None, schema, required = true, defs, None))
                 .getOrElse(List(s"No items schema for array $name").leftIor)
                 .map(itemElem => FormElement.Multivalue(core(Seq()), itemElem))
             case SchemaType.Number  => FormElement.Number(core(Seq()), isInteger = false).rightIor

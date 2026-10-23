@@ -88,7 +88,6 @@ class FormFromJsonSchemaSpec extends AnyFreeSpec {
       case class Interim(a: Option[A]) derives TSchema
       case class Foo(x: Interim) derives TSchema
       val form1        = getForm[Foo](nullableOptions = true)
-      // this doesnt work yet, its here to document the problem
       assert(
         form1 == FormElement.Group(
           simpleCore("Foo"),
@@ -97,7 +96,7 @@ class FormFromJsonSchemaSpec extends AnyFreeSpec {
               simpleCore("x", "Interim"),
               List(
                 FormElement.Select(
-                  simpleCore("_$A"),
+                  optionalCore("a", "_$A"),
                   List("A1", "A2"),
                 ),
               ),
@@ -105,6 +104,24 @@ class FormFromJsonSchemaSpec extends AnyFreeSpec {
           ),
         ),
       )
+    }
+
+    "optional fields are not required" - {
+      case class Opt(a: Option[String], b: String) derives TSchema
+      val expected = FormElement.Group(
+        simpleCore("Opt"),
+        List(
+          FormElement.Text(optionalCore("a", "A"), Format.Raw),
+          FormElement.Text(simpleCore("b", "B"), Format.Raw),
+        ),
+      )
+
+      "without nullable options" in {
+        assert(getForm[Opt]() == expected)
+      }
+      "with nullable options" in {
+        assert(getForm[Opt](nullableOptions = true) == expected)
+      }
     }
 
     "list → Multivalue with Text inside" in {
@@ -292,4 +309,7 @@ class FormFromJsonSchemaSpec extends AnyFreeSpec {
 
   def simpleCore(name: String, label: String = null): FormElement.Core[Any] =
     FormElement.Core(name, Option(label).getOrElse(name), None, Seq())
+
+  def optionalCore(name: String, label: String): FormElement.Core[Any] =
+    FormElement.Core(name, label, None, Seq(), required = false)
 }

@@ -12,7 +12,7 @@ object FormStateToJson {
       Json.fromDoubleOrNull(x.value)
     case x: FormElementState.Checkbox    => Json.fromBoolean(x.value)
     case x: FormElementState.Select      => Json.fromString(x.value)
-    case x: FormElementState.Group       => Json.fromFields(x.value.map(elem => elem.id -> extract(elem)))
+    case x: FormElementState.Group       => Json.fromFields(x.value.filterNot(isBlankOptional).map(elem => elem.id -> extract(elem)))
     case x: FormElementState.Multivalue  => Json.fromValues(x.value.map(extract))
     case x: FormElementState.Alternative =>
       val base              = extract(x.value.states(x.value.selected))
@@ -22,6 +22,13 @@ object FormStateToJson {
       } yield asObj.+:(disc -> Json.fromString(x.element.variants(x.value.selected).core.id)).asJson
       withDiscriminator.getOrElse(base)
   }
+
+  private def isBlankOptional(element: FormElementState): Boolean =
+    !element.element.core.required && (element match {
+      case x: FormElementState.Text   => x.value.isEmpty
+      case x: FormElementState.Number => x.value.isEmpty
+      case _                          => false
+    })
 
   // Extension method for easier conversion
   extension (formState: FormElementState) def extractJson: Json = extract(formState)
